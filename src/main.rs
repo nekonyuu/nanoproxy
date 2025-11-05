@@ -15,21 +15,11 @@ use tracing::error;
 use tracing_subscriber::EnvFilter;
 
 use adapters::{
-    BeaconPoller, ConnectionTracker, CredentialProvider, HyperConnector, HyperHttpClient, HyperProxyAdapter,
-    PacProxyResolver, ResolvConfListener,
+    BeaconPoller, ConfigurationHolder, ConnectionTracker, CredentialProvider, HyperConnector, HyperHttpClient,
+    HyperProxyAdapter, PacProxyResolver, ResolvConfListener,
 };
 use domain::{AuthRule, PacRule, ProxyService, ResolvConfRule};
-
-#[derive(Debug, Serialize, Deserialize)]
-struct SystemConfiguration {
-    max_connections: u64,
-}
-
-impl Default for SystemConfiguration {
-    fn default() -> Self {
-        Self { max_connections: 1024 }
-    }
-}
+use ports::configuration::SystemConfiguration;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ProxyConfig {
@@ -88,11 +78,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     setrlimit(Resource::NOFILE, max_connections, hard_limit)?;
 
+    // Create configuration holder
+    let config_holder = ConfigurationHolder::new(
+        cfg.auth_rules.unwrap_or_default(),
+        cfg.pac_rules.unwrap_or_default(),
+        cfg.resolvconf_rules.unwrap_or_default(),
+        cfg.system.clone(),
+    );
+
     // Create ports (dependency injection)
     let resolver: Arc<dyn ports::ProxyResolverPort> = Arc::new(PacProxyResolver::new());
 
-    let auth_rules = cfg.auth_rules.unwrap_or_default();
-    let credentials: Arc<dyn ports::CredentialsPort> = Arc::new(CredentialProvider::new(auth_rules));
+    let credentials: Arc<dyn ports::CredentialsPort> = Arc::new(CredentialProvider::new(config_holder.clone()));
 
     let tracker = Arc::new(ConnectionTracker::new());
     let tracker_port: Arc<dyn ports::TrackingPort> = tracker.clone();
@@ -100,17 +97,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start background tasks
     tracker.start_cleanup();
 
-    // Start beacon poller if configured
-    if let Some(pac_rules) = cfg.pac_rules {
-        let poller = BeaconPoller::new(pac_rules, resolver.clone());
+    // Start beacon poller if pac_rules configured
+    let pac_rules = config_holder.get_pac_rules().await;
+    if !pac_rules.is_empty() {
+        let poller = BeaconPoller::new(config_holder.clone(), resolver.clone());
         poller.start();
     }
 
-    // Start resolvconf listener if configured
-    if let Some(resolvconf_rules) = cfg.resolvconf_rules {
-        let listener = ResolvConfListener::new(resolvconf_rules, resolver.clone());
+    // Start resolvconf listener if resolvconf_rules configured
+    let resolvconf_rules = config_holder.get_resolvconf_rules().await;
+    if !resolvconf_rules.is_empty() {
+        let listener = ResolvConfListener::new(config_holder.clone(), resolver.clone());
         listener.start()?;
     }
+
+    // Set up SIGHUP handler for configuration reload
+    let config_holder_reload = config_holder.clone();
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sighup = signal(SignalKind::hangup()).expect("Failed to setup SIGHUP handler");
+        loop {
+            sighup.recv().await;
+            match reload_configuration(&config_holder_reload).await {
+                Ok(_) => tracing::info!("Configuration reloaded successfully"),
+                Err(e) => tracing::error!("Failed to reload configuration: {}", e),
+            }
+        }
+    });
 
     // Create Hyper client with connector
     let connector = HyperConnector::new(resolver.clone());
@@ -163,6 +176,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+}
+
+async fn reload_configuration(config_holder: &Arc<ConfigurationHolder>) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = confy::load::<ProxyConfig>("nanoproxy", "nanoproxy")?;
+
+    config_holder
+        .reload(
+            cfg.auth_rules.unwrap_or_default(),
+            cfg.pac_rules.unwrap_or_default(),
+            cfg.resolvconf_rules.unwrap_or_default(),
+            cfg.system,
+        )
+        .await;
+
+    Ok(())
 }
 
 fn print_greeting(listener: &TcpListener) {

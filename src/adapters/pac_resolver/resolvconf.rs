@@ -1,5 +1,5 @@
 use crate::domain::{ProxyError, ResolvConfRule, Result};
-use crate::ports::ProxyResolverPort;
+use crate::ports::{ConfigurationPort, ProxyResolverPort};
 use ipnet::Ipv4Net;
 use log::warn;
 use notify_debouncer_mini::new_debouncer;
@@ -10,24 +10,24 @@ use std::time::Duration;
 
 /// Listener for /etc/resolv.conf changes
 pub struct ResolvConfListener {
-    rules: Vec<ResolvConfRule>,
+    config: Arc<dyn ConfigurationPort>,
     resolver: Arc<dyn ProxyResolverPort>,
 }
 
 impl ResolvConfListener {
-    pub fn new(rules: Vec<ResolvConfRule>, resolver: Arc<dyn ProxyResolverPort>) -> Self {
-        Self { rules, resolver }
+    pub fn new(config: Arc<dyn ConfigurationPort>, resolver: Arc<dyn ProxyResolverPort>) -> Self {
+        Self { config, resolver }
     }
 
     /// Start listening to resolv.conf changes
     pub fn start(self) -> Result<tokio::task::JoinHandle<()>> {
         // Initial refresh
         let resolver_clone = self.resolver.clone();
-        let rules_clone = self.rules.clone();
+        let config_clone = self.config.clone();
 
         tokio::spawn(async move {
             // Do initial refresh
-            if let Err(e) = Self::refresh_rules_static(&rules_clone, &resolver_clone).await {
+            if let Err(e) = Self::refresh_rules_static(&config_clone, &resolver_clone).await {
                 log::error!("Failed initial resolv.conf refresh: {}", e);
             }
 
@@ -52,7 +52,7 @@ impl ResolvConfListener {
             for result in rx {
                 match result {
                     Ok(_) => {
-                        if let Err(e) = Self::refresh_rules_static(&rules_clone, &resolver_clone).await {
+                        if let Err(e) = Self::refresh_rules_static(&config_clone, &resolver_clone).await {
                             log::info!("Failed to parse resolv.conf: {:?}", e);
                         }
                     }
@@ -64,7 +64,9 @@ impl ResolvConfListener {
         Ok(tokio::spawn(async {}))
     }
 
-    async fn refresh_rules_static(rules: &[ResolvConfRule], resolver: &Arc<dyn ProxyResolverPort>) -> Result<()> {
+    async fn refresh_rules_static(config: &Arc<dyn ConfigurationPort>, resolver: &Arc<dyn ProxyResolverPort>) -> Result<()> {
+        let rules = config.get_resolvconf_rules().await;
+
         let mut buf = Vec::with_capacity(4096);
         let mut f = std::fs::File::open("/etc/resolv.conf")
             .map_err(|e| ProxyError::ResolutionFailed(format!("Cannot open resolv.conf: {}", e)))?;
@@ -78,7 +80,7 @@ impl ResolvConfListener {
         for ip in cfg.get_nameservers_or_local() {
             if !matched {
                 if let ScopedIp::V4(ip) = ip {
-                    for rule in rules {
+                    for rule in &rules {
                         let net: Ipv4Net = rule
                             .resolver_subnet
                             .parse()

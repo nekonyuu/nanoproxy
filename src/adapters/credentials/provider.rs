@@ -1,5 +1,5 @@
-use crate::domain::{AuthRule, Credentials, ProxyError, Result};
-use crate::ports::CredentialsPort;
+use crate::domain::{Credentials, ProxyError, Result};
+use crate::ports::{ConfigurationPort, CredentialsPort};
 use async_trait::async_trait;
 use lru::LruCache;
 use std::collections::HashMap;
@@ -10,12 +10,28 @@ use tokio::sync::RwLock;
 
 /// Credential provider implementation
 pub struct CredentialProvider {
+    config: Arc<dyn ConfigurationPort>,
     rules: Arc<RwLock<HashMap<String, (String, String)>>>,
     cache: Arc<RwLock<LruCache<String, Option<Credentials>>>>,
 }
 
 impl CredentialProvider {
-    pub fn new(auth_rules: Vec<AuthRule>) -> Self {
+    pub fn new(config: Arc<dyn ConfigurationPort>) -> Self {
+        Self {
+            config,
+            rules: Arc::new(RwLock::new(HashMap::new())),
+            cache: Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(5).unwrap()))),
+        }
+    }
+
+    async fn ensure_rules_loaded(&self) {
+        let rules_lock = self.rules.read().await;
+        if !rules_lock.is_empty() {
+            return;
+        }
+        drop(rules_lock);
+
+        let auth_rules = self.config.get_auth_rules().await;
         let mut rules_map = HashMap::new();
 
         for rule in auth_rules {
@@ -24,10 +40,8 @@ impl CredentialProvider {
             rules_map.insert(rule.remote_pattern, (rule.username, password));
         }
 
-        Self {
-            rules: Arc::new(RwLock::new(rules_map)),
-            cache: Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(5).unwrap()))),
-        }
+        let mut rules_lock = self.rules.write().await;
+        *rules_lock = rules_map;
     }
 
     fn execute_password_command(cmd: &str) -> Result<String> {
@@ -46,6 +60,8 @@ impl CredentialProvider {
         if host.is_empty() {
             return None;
         }
+
+        self.ensure_rules_loaded().await;
 
         let rules = self.rules.read().await;
 

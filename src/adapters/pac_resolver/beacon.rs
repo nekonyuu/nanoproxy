@@ -1,5 +1,5 @@
-use crate::domain::{PacRule, Result};
-use crate::ports::ProxyResolverPort;
+use crate::domain::Result;
+use crate::ports::{ConfigurationPort, ProxyResolverPort};
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,13 +7,13 @@ use tokio::time::interval;
 
 /// Beacon poller that checks if proxy hosts are reachable
 pub struct BeaconPoller {
-    rules: Vec<PacRule>,
+    config: Arc<dyn ConfigurationPort>,
     resolver: Arc<dyn ProxyResolverPort>,
 }
 
 impl BeaconPoller {
-    pub fn new(rules: Vec<PacRule>, resolver: Arc<dyn ProxyResolverPort>) -> Self {
-        Self { rules, resolver }
+    pub fn new(config: Arc<dyn ConfigurationPort>, resolver: Arc<dyn ProxyResolverPort>) -> Self {
+        Self { config, resolver }
     }
 
     /// Start polling beacons in the background
@@ -30,8 +30,9 @@ impl BeaconPoller {
         })
     }
 
-    fn select_pac_url(&self) -> Option<String> {
-        for rule in &self.rules {
+    async fn select_pac_url(&self) -> Option<String> {
+        let rules = self.config.get_pac_rules().await;
+        for rule in &rules {
             // Try to resolve the beacon host
             if rule.beacon_host.to_socket_addrs().is_ok() {
                 return Some(rule.pac_url.clone());
@@ -41,7 +42,7 @@ impl BeaconPoller {
     }
 
     async fn refresh_pac_url(&self) -> Result<()> {
-        let pac_url = self.select_pac_url();
+        let pac_url = self.select_pac_url().await;
         self.resolver.update_pac_url(pac_url).await
     }
 }
